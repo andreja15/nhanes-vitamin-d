@@ -1,0 +1,330 @@
+# -------------------------------------------------------
+# Import and Clean NHANES Data
+# -------------------------------------------------------
+vitamin_d <- read_xpt("VID_J.XPT") %>% clean_names() %>% select(seqn, lbxvidms)
+depression <- read_xpt("DPQ_J.XPT") %>% clean_names() %>% select(seqn, dpq010:dpq090)
+demo <- read_xpt("DEMO_J.XPT") %>% clean_names() %>%
+  select(seqn, ridageyr, riagendr, ridreth3, indfmpir, ridexmon, wtmec2yr, sdmvpsu, sdmvstra)
+bmi <- read_xpt("BMX_J.XPT") %>% clean_names() %>% select(seqn, bmxbmi)
+activity <- read_xpt("PAQ_J.XPT") %>% clean_names() %>% select(seqn, paq650, paq665)
+
+# -------------------------------------------------------
+# Merge All Datasets
+# -------------------------------------------------------
+nhanes_full <- vitamin_d %>%
+  inner_join(depression, by = "seqn") %>%
+  inner_join(demo, by = "seqn") %>%
+  inner_join(bmi, by = "seqn") %>%
+  inner_join(activity, by = "seqn")
+
+# -------------------------------------------------------
+# Drop Rows with NA in Key Variables
+# -------------------------------------------------------
+key_vars <- c("lbxvidms", paste0("dpq0", c("10", "20", "30", "40", "50", "60", "70", "80", "90")),
+              "ridageyr", "riagendr", "ridreth3", "indfmpir", "bmxbmi", "paq650", "paq665")
+
+nhanes_clean <- nhanes_full %>%
+  drop_na(all_of(key_vars))
+
+# -------------------------------------------------------
+# Create Derived Variables
+# -------------------------------------------------------
+nhanes_clean <- nhanes_clean %>%
+  mutate(
+    # PHQ-9 Total Score and Binary Outcome
+    phq9_score = rowSums(select(., dpq010:dpq090)),
+    depression_status = ifelse(phq9_score >= 10, "Depressed", "Not Depressed"),
+    depression_bin = as.integer(depression_status == "Depressed"),
+
+    # Vitamin D Binary Exposure
+    vitd_binary = factor(ifelse(lbxvidms < 30, "Low", "Normal"), levels = c("Normal", "Low")),
+
+    # Age Group Categorization
+    age_group = case_when(
+      ridageyr >= 18 & ridageyr <= 29 ~ "18–29",
+      ridageyr >= 30 & ridageyr <= 44 ~ "30–44",
+      ridageyr >= 45 & ridageyr <= 59 ~ "45–59",
+      ridageyr >= 60 ~ "60+"
+    ) %>% factor(levels = c("18–29", "30–44", "45–59", "60+")),
+
+    # Season of interview
+    season = factor(ridexmon, levels = c(1, 2), labels = c("Nov–Apr", "May–Oct")),
+
+    # Gender
+    gender = factor(riagendr, labels = c("Male", "Female")),
+
+    # Race/Ethnicity
+    race_ethnicity = factor(ridreth3,
+      levels = c(1, 2, 3, 4, 6, 7),
+      labels = c("Mexican American", "Other Hispanic", "Non-Hispanic White",
+                 "Non-Hispanic Black", "Non-Hispanic Asian", "Other/Multi")),
+
+    # Physical activity: vigorous and moderate merged
+    vigorous_activity = factor(paq650, levels = c(1, 2), labels = c("Yes", "No")),
+    moderate_activity = factor(paq665, levels = c(1, 2), labels = c("Yes", "No")),
+
+    activity_combined = case_when(
+      paq650 == 1 | paq665 == 1 ~ "Any Activity",
+      paq650 == 2 & paq665 == 2 ~ "No Activity",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("No Activity", "Any Activity")),
+
+    # Income Grouping
+    income_group = cut(indfmpir,
+                       breaks = c(0, 1.3, 3, 5, Inf),
+                       labels = c("Low", "Middle", "High", "Very High"),
+                       right = FALSE)
+  )
+
+# -------------------------------------------------------
+# Define Survey Design
+# -------------------------------------------------------
+nhanes_design <- svydesign(
+  ids = ~sdmvpsu,
+  strata = ~sdmvstra,
+  weights = ~wtmec2yr,
+  data = nhanes_clean,
+  nest = TRUE
+)
+
+# -------------------------------------------------------
+# FULL Survey Model 
+# -------------------------------------------------------
+full_model <- svyglm(
+  depression_bin ~ vitd_binary + age_group + season + gender +
+    race_ethnicity + indfmpir + bmxbmi + activity_combined,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+# -------------------------------------------------------
+# Odds Ratio Table
+# -------------------------------------------------------
+full_or <- tidy(full_model) %>%
+  mutate(
+    OR = round(exp(estimate), 2),
+    SE = std.error,
+    CI_lower = round(exp(estimate - 1.96 * SE), 2),
+    CI_upper = round(exp(estimate + 1.96 * SE), 2),
+    CI = paste0("(", CI_lower, ", ", CI_upper, ")"),
+    p_value = format.pval(2 * (1 - pnorm(abs(estimate / SE))), digits = 4, eps = .0001),
+    term = recode(term,
+      "vitd_binaryLow" = "Low Vitamin D",
+      "age_group30–44" = "Age 30–44",
+      "age_group45–59" = "Age 45–59",
+      "age_group60+" = "Age 60+",
+      "seasonMay–Oct" = "Season: May–Oct",
+      "genderFemale" = "Female",
+      "race_ethnicityOther Hispanic" = "Race: Other Hispanic",
+      "race_ethnicityNon-Hispanic White" = "Race: White",
+      "race_ethnicityNon-Hispanic Black" = "Race: Black",
+      "race_ethnicityNon-Hispanic Asian" = "Race: Asian",
+      "race_ethnicityOther/Multi" = "Race: Other/Multi",
+      "indfmpir" = "Income-Poverty Ratio",
+      "bmxbmi" = "Body Mass Index (BMI)",
+      "activity_combinedAny Activity" = "Any Activity"
+    )
+  ) %>%
+  select(term, OR, CI, p_value)
+
+print(full_or)
+
+# -------------------------------------------------------
+# Forest Plot
+# -------------------------------------------------------
+ggplot(full_or, aes(x = OR, y = reorder(term, OR))) +
+  geom_point(aes(color = OR > 1), size = 3) +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high, color = OR > 1), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "purple") +
+  scale_color_manual(values = c("red", "blue"), guide = "none") +
+  labs(title = "Forest Plot: Full Depression Model",
+       x = "Odds Ratio", y = NULL) +
+  theme_minimal()
+
+# -------------------------------------------------------
+# Confounder Screening 
+# -------------------------------------------------------
+get_chisq_p <- function(var) {
+  tab1 <- table(nhanes_clean[[var]], nhanes_clean$vitd_binary)
+  tab2 <- table(nhanes_clean[[var]], nhanes_clean$depression_status)
+  data.frame(Variable = var,
+             P_VitD = chisq.test(tab1)$p.value,
+             P_Depression = chisq.test(tab2)$p.value)
+}
+
+confounders <- c("age_group", "season", "gender", "race_ethnicity", "activity_combined", "income_group")
+confounder_results <- do.call(rbind, lapply(confounders, get_chisq_p))
+print(confounder_results)
+
+# -------------------------------------------------------
+# Modified Survey Model (no BMI or activity)
+# -------------------------------------------------------
+mod_model <- svyglm(
+  depression_bin ~ vitd_binary + age_group + season + gender +
+    race_ethnicity + indfmpir,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+# -------------------------------------------------------
+# Modified Odds Ratio Table
+# -------------------------------------------------------
+mod_or <- tidy(mod_model) %>%
+  mutate(
+    OR = exp(estimate),
+    SE = std.error,
+    z = estimate / SE,
+    CI_low = exp(estimate - 1.96 * SE),
+    CI_high = exp(estimate + 1.96 * SE),
+    p_value = 2 * (1 - pnorm(abs(z))),
+    CI = paste0("(", round(CI_low, 2), ", ", round(CI_high, 2), ")"),
+    term = recode(term,
+      "vitd_binaryLow" = "Low Vitamin D",
+      "age_group30–44" = "Age 30–44",
+      "age_group45–59" = "Age 45–59",
+      "age_group60+" = "Age 60+",
+      "seasonMay–Oct" = "Season: May–Oct",
+      "genderFemale" = "Female",
+      "race_ethnicityOther Hispanic" = "Race: Other Hispanic",
+      "race_ethnicityNon-Hispanic White" = "Race: White",
+      "race_ethnicityNon-Hispanic Black" = "Race: Black",
+      "race_ethnicityNon-Hispanic Asian" = "Race: Asian",
+      "race_ethnicityOther/Multi" = "Race: Other/Multi",
+      "indfmpir" = "Income-Poverty Ratio"
+    )
+  ) %>%
+  mutate(
+    OR = round(OR, 2),
+    CI_low = round(CI_low, 2),
+    CI_high = round(CI_high, 2),
+    p_value = ifelse(p_value < 0.001, "<0.001", round(p_value, 3))
+  ) %>%
+  select(term, OR, CI_low, CI_high, CI, p_value)
+
+print(mod_or)
+
+# -------------------------------------------------------
+# Modified Forest Plot
+# -------------------------------------------------------
+ggplot(mod_or, aes(x = OR, y = reorder(term, OR))) +
+  geom_point(aes(color = OR > 1), size = 3) +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high, color = OR > 1), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "purple") +
+  scale_color_manual(values = c("red", "blue"), guide = "none") +
+  labs(title = "Forest Plot: Modified Depression Model",
+       x = "Odds Ratio", y = NULL) +
+  theme_minimal()
+
+# -------------------------------------------------------
+# Forward Stepwise Selection: Modified Model using income_group
+# -------------------------------------------------------
+
+# Null model with only the main exposure
+mod_start_model <- glm(
+  depression_bin ~ vitd_binary,
+  data = nhanes_clean,
+  family = binomial()
+)
+
+# Scope model for stepwise selection 
+mod_scope_model <- glm(
+  depression_bin ~ vitd_binary + age_group + season + gender +
+    race_ethnicity + income_group,
+  data = nhanes_clean,
+  family = binomial()
+)
+
+# Run forward selection
+mod_step_model <- step(
+  object = mod_start_model,
+  scope = list(lower = mod_start_model, upper = mod_scope_model),
+  direction = "forward"
+)
+summary(mod_step_model)
+
+# -------------------------------------------------------
+# Plot: Depression by Vitamin D Status
+# -------------------------------------------------------
+ggplot(nhanes_clean, aes(x = vitd_binary, fill = depression_status)) +
+  geom_bar(position = "fill", color = "black") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("lightblue", "darkblue")) +
+  labs(title = "Percent Depressed by Vitamin D Status",
+       x = "Vitamin D Level", y = "Percentage", fill = NULL) +
+  theme_minimal()
+
+# -------------------------------------------------------
+# Plot: Depression by Income Group
+# -------------------------------------------------------
+ggplot(nhanes_clean, aes(x = income_group, fill = depression_status)) +
+  geom_bar(position = "fill", color = "black") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("lightblue", "darkblue")) +
+  labs(
+    title = "Depression by Income Group",
+    x = "Income Group",
+    y = "Proportion",
+    fill = "Depression Status"
+  ) +
+  theme_minimal()
+  
+# -------------------------------------------------------
+# Plot: Depression by Race/Ethnicity
+# -------------------------------------------------------
+ggplot(nhanes_clean, aes(x = race_ethnicity, fill = depression_status)) +
+  geom_bar(position = "fill", color = "black") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("lightblue", "darkblue")) +
+  labs(
+    title = "Depression by Race/Ethnicity",
+    x = "Race/Ethnicity",
+    y = "Proportion",
+    fill = "Depression Status"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+# -------------------------------------------------------
+# Plot: Depression by Physical Activity
+# -------------------------------------------------------
+ggplot(nhanes_clean, aes(x = activity_combined, fill = depression_status)) +
+  geom_bar(position = "fill", color = "black") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("lightblue", "darkblue")) +
+  labs(
+    title = "Depression by Physical Activity",
+    x = "Activity Level",
+    y = "Proportion",
+    fill = "Depression Status"
+  ) +
+  theme_minimal()
+  
+# -------------------------------------------------------  
+# Plot: Depression by Season
+# -------------------------------------------------------
+ggplot(nhanes_clean, aes(x = season, fill = depression_status)) +
+  geom_bar(position = "fill", color = "black") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("lightblue", "darkblue")) +
+  labs(
+    title = "Depression by Season",
+    x = "Season of Interview",
+    y = "Proportion",
+    fill = "Depression Status"
+  ) +
+  theme_minimal()
+  
+# -------------------------------------------------------
+# Plot: Depression by Gender
+# -------------------------------------------------------
+ggplot(nhanes_clean, aes(x = gender, fill = depression_status)) +
+  geom_bar(position = "fill", color = "black") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("lightblue", "darkblue")) +
+  labs(
+    title = "Depression by Gender",
+    x = "Gender",
+    y = "Proportion",
+    fill = "Depression Status"
+  ) +
+  theme_minimal()
